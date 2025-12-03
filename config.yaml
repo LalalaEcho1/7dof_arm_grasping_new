@@ -55,7 +55,7 @@ curriculum_schedule:
   lift:
     start: 0.75
     end: 1.0
-    description: "抓取 + 抬升2cm"
+    description: "抓取 + 抬升5cm"
 
 demo_episodes: 3
 demo_sleep_time: 0.02

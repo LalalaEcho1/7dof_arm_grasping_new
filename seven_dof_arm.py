@@ -30,13 +30,6 @@ class SevenDOFArmEnv(gym.Env):
         self.model = mujoco.MjModel.from_xml_path(fullpath)
         self.data = mujoco.MjData(self.model)
 
-                # [新增] 初始化渲染器 (用于视频录制)
-        if self.render_mode == 'rgb_array':
-            # 480x640 是比较清晰且文件体积适中的分辨率
-            self.renderer = mujoco.Renderer(self.model, height=480, width=640)
-        else:
-            self.renderer = None
-
         # ------------------ ID ------------------
         def safe_name2id(objtype, name):
             try:
@@ -99,6 +92,10 @@ class SevenDOFArmEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.steps = 0
         self.viewer = None
+        
+        # 🔧 新增：抓取状态追踪（用于决定是否允许物体移动）
+        self.grasp_achieved = False  # 是否已建立有效抓取
+        self.grasp_hold_steps = 0    # 连续抓取步数
 
         # ------------------ 🔧 简化的课程学习 ------------------
         self.is_training = is_training
@@ -165,19 +162,8 @@ class SevenDOFArmEnv(gym.Env):
 
         mujoco.mj_resetData(self.model, self.data)
 
-        # --- 修改 1: 随机化物体位置 (在一定范围内) ---
-        # 例如：X 在 [0.3, 0.4], Y 在 [-0.1, 0.1]
-        target_x = self.np_random.uniform(0.3, 0.4)
-        target_y = self.np_random.uniform(-0.1, 0.1)
-        target_z = 0.025
+        target_x, target_y, target_z = 0.35, 0.0, 0.025
         self.target_pos = np.array([target_x, target_y, target_z])
-
-         # --- 修改 2: 随机化机械臂初始角度 (微小扰动) ---
-         # 给每个关节加一点点噪声 (+- 0.05弧度)
-         base_angles = np.array([0.0, -0.3, 0.0, -1.8, 0.0, 1.5, -0.785])
-         noise = self.np_random.uniform(-0.05, 0.05, size=7)
-         initial_joint_angles = base_angles + noise
-
 
         if self.target_body_id >= 0:
             obj_adr = self.model.jnt_qposadr[self.model.body_jntadr[self.target_body_id]]
@@ -244,6 +230,10 @@ class SevenDOFArmEnv(gym.Env):
         self.contact_hold_counter = 0
         self._render_counter = 0
         self.current_episode_success = False
+        
+        # 🔧 重置抓取状态
+        self.grasp_achieved = False
+        self.grasp_hold_steps = 0
 
         return self._get_obs(), {}
 
@@ -284,6 +274,7 @@ class SevenDOFArmEnv(gym.Env):
 
         mujoco.mj_step(self.model, self.data)
 
+        # 🔧 改进的物体复位逻辑
         if self.target_body_id >= 0:
             has_contact = False
             for i in range(self.data.ncon):
@@ -295,17 +286,41 @@ class SevenDOFArmEnv(gym.Env):
                         has_contact = True
                         break
 
-            if not has_contact:
+            # 🔧 更新抓取状态追踪
+            if has_contact:
+                self.grasp_hold_steps += 1
+                # 连续接触超过一定步数，认为建立了有效抓取
+                if self.grasp_hold_steps >= 3:
+                    self.grasp_achieved = True
+            else:
+                # 如果失去接触，但之前已建立抓取，给一个宽容窗口
+                if not self.grasp_achieved:
+                    self.grasp_hold_steps = 0
+
+            # 🔧 关键改动：只在以下情况重置物体
+            # 1. 尚未建立有效抓取（grasp_achieved = False）
+            # 2. 不在 lift 阶段
+            # 3. 物体偏离超过阈值
+            should_reset_object = False
+            if not has_contact and not self.grasp_achieved:
                 obj_adr = self.model.jnt_qposadr[self.model.body_jntadr[self.target_body_id]]
                 current_pos = self.data.xpos[self.target_body_id].copy()
                 pos_error = np.linalg.norm(current_pos - self.target_pos)
-
-                if pos_error > 0.01:
+                
+                # 在 distance/contact 阶段，物体偏移超过 3cm 才重置
+                # 在 grasp/lift 阶段，物体偏移超过 8cm 才重置（允许更多尝试）
+                reset_threshold = 0.03 if self.success_mode in ["distance", "contact"] else 0.08
+                
+                if pos_error > reset_threshold:
+                    should_reset_object = True
                     self.data.qpos[obj_adr:obj_adr + 3] = self.target_pos
                     self.data.qpos[obj_adr + 3:obj_adr + 7] = [1, 0, 0, 0]
                     vel_adr = self.model.jnt_dofadr[self.model.body_jntadr[self.target_body_id]]
                     self.data.qvel[vel_adr:vel_adr + 6] = 0.0
                     mujoco.mj_forward(self.model, self.data)
+                    # 重置抓取状态
+                    self.grasp_achieved = False
+                    self.grasp_hold_steps = 0
 
         joint_modified = False
         joint_delta = None
@@ -384,10 +399,26 @@ class SevenDOFArmEnv(gym.Env):
         grasp_reward = self.reward_weights['grasp'] if (
                     left_contact and right_contact and contact_hold_frac > 0.5) else 0.0
 
+        # 🔧 改进的 lift 奖励：更细粒度的渐进奖励
+        # 🎯 提升目标：5cm (0.05m)
+        LIFT_TARGET = 0.05  # 目标提升高度
         lift_bonus = 0.0
-        if height_gain > 0.01:
-            # 抬得越高分越高，最大限制在 1.0 * weight
-            lift_bonus = self.reward_weights['lift'] * min(height_gain / 0.05, 1.0)
+        if self.grasp_achieved:
+            # 只有在建立有效抓取后才给 lift 奖励
+            if height_gain > 0.005:  # 从 0.5cm 就开始给奖励
+                # 渐进式奖励：高度增益越大，奖励越高
+                lift_bonus = self.reward_weights['lift'] * min(height_gain / LIFT_TARGET, 1.0)
+            # 额外奖励：如果已抓取且在向上移动
+            if height_gain > 0.0 and self.success_mode == "lift":
+                lift_bonus += 2.0  # 鼓励任何高度增益
+            # 🏆 里程碑奖励：鼓励逐步提升
+            if height_gain > 0.02:   # 超过 2cm
+                lift_bonus += 3.0
+            if height_gain > 0.04:   # 超过 4cm
+                lift_bonus += 5.0
+        elif height_gain > 0.01:
+            # 未建立抓取但物体有上升（可能是碰撞），给少量奖励
+            lift_bonus = self.reward_weights['lift'] * 0.1 * min(height_gain / LIFT_TARGET, 1.0)
 
         # 5. 动作平滑惩罚
         action_penalty = self.reward_weights['action_penalty'] * np.sum(np.square(action))
@@ -405,7 +436,9 @@ class SevenDOFArmEnv(gym.Env):
         # 7. 成功判定
         contact_success = left_contact and right_contact
         grasp_success = contact_success and contact_hold_frac > 0.6
-        lift_success = height_gain > 0.025
+        # 🔧 改进的 lift 判定：需要同时满足抬升高度 + 保持抓取
+        # 🎯 目标：抬升 5cm (0.05m) 才算成功
+        lift_success = height_gain > 0.05 and self.grasp_achieved
 
         if self.success_mode == "distance":
             success = distance_to_object < 0.05  # 判定更严格一点
@@ -414,6 +447,7 @@ class SevenDOFArmEnv(gym.Env):
         elif self.success_mode == "grasp":
             success = grasp_success
         elif self.success_mode == "lift":
+            # 🔧 降低 lift 成功的高度要求，但需要稳定抓取
             success = lift_success
         else:
             success = False
@@ -456,6 +490,8 @@ class SevenDOFArmEnv(gym.Env):
             "left_contact": left_contact,
             "right_contact": right_contact,
             "gripper_closed": gripper_closed,
+            "grasp_achieved": self.grasp_achieved,  # 🔧 新增：抓取状态
+            "success_mode": self.success_mode,      # 🔧 新增：当前阶段
             "reward_total": reward,
         }
 
@@ -520,31 +556,23 @@ class SevenDOFArmEnv(gym.Env):
             pass
 
     def render(self):
-        # 1. 视频录制模式 (返回图像数组)
-        if self.render_mode == 'rgb_array':
-            # 更新渲染器场景
-            self.renderer.update_scene(self.data)
-            # 返回 (H, W, C) 的 numpy 数组
-            return self.renderer.render()
-            
-        # 2. 人类观察模式 (弹出窗口)
-        elif self.render_mode == 'human':
-            self._render() # 调用你原有的 _render 逻辑
+        if self.render_mode == 'human':
+            self._render()
             return None
-
+        elif self.render_mode == 'rgb_array' and self.viewer is not None:
+            try:
+                return self.viewer.read_pixels()
+            except Exception:
+                pass
+        return None
 
     def close(self):
-        # 清理 viewer (human模式)
         if hasattr(self, 'viewer') and self.viewer is not None:
             try:
                 self.viewer.close()
             except Exception:
                 pass
             self.viewer = None
-            
-        # [新增] 清理 renderer (rgb_array模式)
-        if hasattr(self, 'renderer') and self.renderer is not None:
-            self.renderer.close()
 
     def update_success_rate(self, success_flag):
         self._update_internal_success_rate(success_flag)
