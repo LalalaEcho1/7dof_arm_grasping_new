@@ -165,8 +165,19 @@ class SevenDOFArmEnv(gym.Env):
 
         mujoco.mj_resetData(self.model, self.data)
 
-        target_x, target_y, target_z = 0.35, 0.0, 0.025
+        # --- 修改 1: 随机化物体位置 (在一定范围内) ---
+        # 例如：X 在 [0.3, 0.4], Y 在 [-0.1, 0.1]
+        target_x = self.np_random.uniform(0.3, 0.4)
+        target_y = self.np_random.uniform(-0.1, 0.1)
+        target_z = 0.025
         self.target_pos = np.array([target_x, target_y, target_z])
+
+         # --- 修改 2: 随机化机械臂初始角度 (微小扰动) ---
+         # 给每个关节加一点点噪声 (+- 0.05弧度)
+         base_angles = np.array([0.0, -0.3, 0.0, -1.8, 0.0, 1.5, -0.785])
+         noise = self.np_random.uniform(-0.05, 0.05, size=7)
+         initial_joint_angles = base_angles + noise
+
 
         if self.target_body_id >= 0:
             obj_adr = self.model.jnt_qposadr[self.model.body_jntadr[self.target_body_id]]
