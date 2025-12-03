@@ -30,6 +30,13 @@ class SevenDOFArmEnv(gym.Env):
         self.model = mujoco.MjModel.from_xml_path(fullpath)
         self.data = mujoco.MjData(self.model)
 
+                # [新增] 初始化渲染器 (用于视频录制)
+        if self.render_mode == 'rgb_array':
+            # 480x640 是比较清晰且文件体积适中的分辨率
+            self.renderer = mujoco.Renderer(self.model, height=480, width=640)
+        else:
+            self.renderer = None
+
         # ------------------ ID ------------------
         def safe_name2id(objtype, name):
             try:
@@ -502,23 +509,31 @@ class SevenDOFArmEnv(gym.Env):
             pass
 
     def render(self):
-        if self.render_mode == 'human':
-            self._render()
+        # 1. 视频录制模式 (返回图像数组)
+        if self.render_mode == 'rgb_array':
+            # 更新渲染器场景
+            self.renderer.update_scene(self.data)
+            # 返回 (H, W, C) 的 numpy 数组
+            return self.renderer.render()
+            
+        # 2. 人类观察模式 (弹出窗口)
+        elif self.render_mode == 'human':
+            self._render() # 调用你原有的 _render 逻辑
             return None
-        elif self.render_mode == 'rgb_array' and self.viewer is not None:
-            try:
-                return self.viewer.read_pixels()
-            except Exception:
-                pass
-        return None
+
 
     def close(self):
+        # 清理 viewer (human模式)
         if hasattr(self, 'viewer') and self.viewer is not None:
             try:
                 self.viewer.close()
             except Exception:
                 pass
             self.viewer = None
+            
+        # [新增] 清理 renderer (rgb_array模式)
+        if hasattr(self, 'renderer') and self.renderer is not None:
+            self.renderer.close()
 
     def update_success_rate(self, success_flag):
         self._update_internal_success_rate(success_flag)
