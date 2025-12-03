@@ -1,0 +1,61 @@
+# config.yaml (修改版)
+
+model_params:
+  learning_rate: 3e-4
+  buffer_size: 500000
+  batch_size: 256
+  gamma: 0.99
+  tau: 0.005
+  # 🌟 关键修改1：改为 "auto"，让模型自动调整探索欲，防止过早躺平
+  ent_coef: "auto"
+
+seed: 42
+
+train_params:
+  total_timesteps: 2000000
+
+env:
+  # 🌟 关键修改2：缩短步数。200步足够抓取，不给它刷分的时间
+  max_episode_steps: 200
+  reward_scale: 1.0
+  render_mode: 'None'
+  render_every: 10000
+
+policy_kwargs:
+  net_arch: [256, 256]
+
+target_update_interval: 1
+
+callbacks:
+  checkpoint_freq: 10000
+  eval_freq: 5000
+
+use_early_stopping: true
+early_stopping_patience: 300
+early_stopping_min_success_rate: 0.60
+
+# 课程学习控制保持不变
+curriculum_control:
+  update_every_steps: 500
+  min_stage_steps: 1000
+
+curriculum_schedule:
+  distance:
+    start: 0.0
+    end: 0.25
+    description: "接近到8cm内"
+  contact:
+    start: 0.25
+    end: 0.50
+    description: "双侧接触"
+  grasp:
+    start: 0.50
+    end: 0.75
+    description: "双侧接触 + 保持60%"
+  lift:
+    start: 0.75
+    end: 1.0
+    description: "抓取 + 抬升2cm"
+
+demo_episodes: 3
+demo_sleep_time: 0.02
